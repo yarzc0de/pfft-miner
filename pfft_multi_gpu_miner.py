@@ -559,6 +559,9 @@ def _submit_mint(w3, wallet, contract, nonce: int, prefix: str) -> bool:
 
 
 def main():
+    # Use 'spawn' instead of 'fork' to avoid CUDA re-init issues in child processes
+    multiprocessing.set_start_method("spawn", force=True)
+
     print("=" * 60)
     print("  🚀 PFFT Multi-GPU Miner Bot — NVIDIA CUDA")
     print(f"  Contract: {CONTRACT}")

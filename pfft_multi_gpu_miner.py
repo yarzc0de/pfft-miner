@@ -327,6 +327,9 @@ def gpu_worker(
         wallet_keys: list of hex private keys this worker rotates through
         stop_event: shared event to signal graceful shutdown
     """
+    # Child ignores SIGINT — parent handles it and sets stop_event
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     import numpy as np
     import pycuda.driver as cuda
 
@@ -428,7 +431,10 @@ def gpu_worker(
                     continue
             except Exception as exc:
                 print(f"{prefix} ⚠️  Status error: {exc}, retrying in 15s...")
-                time.sleep(15)
+                for _ in range(150):
+                    if stop_event.is_set():
+                        break
+                    time.sleep(0.1)
                 continue
 
             eth_bal = w3.eth.get_balance(wallet.address) / 1e18
@@ -476,7 +482,7 @@ def gpu_worker(
                 f"{total_pfft:,.2f} PFFT | {elapsed / 60:.1f} min"
             )
 
-            # Rotate to next wallet after each round
+            # Rotate to next wallet after each mint
             wallet_idx = (wallet_idx + 1) % len(wallets)
 
             print(f"{prefix} ⏳ {PAUSE_BETWEEN_ROUNDS}s cooldown...")

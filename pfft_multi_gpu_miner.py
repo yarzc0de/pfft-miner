@@ -12,9 +12,6 @@ If only PRIVATE_KEY is set (no _0, _1, etc.), all GPUs use the same wallet.
 When multiple GPUs share a wallet, their nonce ranges are partitioned to
 avoid duplicate work.
 
-TX submission is non-blocking: after submit, worker rotates to next wallet
-immediately and polls receipts in background while mining continues.
-
 Usage:
   cp .env.example .env   # set PRIVATE_KEY_0, PRIVATE_KEY_1, ... and ETH_RPC
   python3 pfft_multi_gpu_miner.py
@@ -23,7 +20,8 @@ Optional env:
   GPU_BLOCKS=65535
   GPU_THREADS=256
   GPU_BATCHES_PER_STATUS=32
-  GPUS=0,1,2           # specific GPUs to use (default: all available)
+  GPUS=0,1,2              # specific GPUs to use (default: all available)
+  MAX_GAS_PRICE_GWEI=10   # skip TX submit if gas > threshold (0 = disabled)
 """
 
 from __future__ import annotations
@@ -50,6 +48,8 @@ CHAIN_ID = 1
 RPC = os.environ.get("ETH_RPC", "https://ethereum-rpc.publicnode.com")
 GAS_LIMIT = int(os.environ.get("GAS_LIMIT", "200000"))
 PAUSE_BETWEEN_ROUNDS = int(os.environ.get("PAUSE_BETWEEN_ROUNDS", "3"))
+MAX_GAS_PRICE_GWEI = float(os.environ.get("MAX_GAS_PRICE_GWEI", "0"))
+WALLET_CAP_WEI = 10_000 * 10**18
 
 GPU_BLOCKS = int(os.environ.get("GPU_BLOCKS", "65535"))
 GPU_THREADS = int(os.environ.get("GPU_THREADS", "256"))
@@ -315,7 +315,7 @@ def gpu_worker(
     wallet_keys: list[str],
     stop_event: multiprocessing.Event,
 ):
-    """Worker process for a single GPU with wallet rotation + non-blocking TX tracking.
+    """Worker process for a single GPU with wallet rotation.
 
     Args:
         gpu_id: CUDA device index
@@ -390,6 +390,22 @@ def gpu_worker(
                 print(f"{prefix} 🏁 All {len(wallets)} wallet(s) reached cap!")
                 break
 
+            if MAX_GAS_PRICE_GWEI > 0:
+                try:
+                    current_gas_gwei = w3.eth.gas_price / 1e9
+                    if current_gas_gwei > MAX_GAS_PRICE_GWEI:
+                        print(
+                            f"{prefix} ⛽ Gas too high: {current_gas_gwei:.2f} gwei "
+                            f"(max {MAX_GAS_PRICE_GWEI} gwei), waiting 30s..."
+                        )
+                        for _ in range(300):
+                            if stop_event.is_set():
+                                break
+                            time.sleep(0.1)
+                        continue
+                except Exception as exc:
+                    print(f"{prefix} ⚠️  Gas price check failed: {exc}, proceeding anyway...")
+
             found_available = False
             for _ in range(len(wallets)):
                 if wallet_idx not in capped_wallets and wallet_idx not in pending_txs:
@@ -440,8 +456,18 @@ def gpu_worker(
                 if total_minted >= max_supply:
                     print(f"{prefix} 🏁 Max supply reached!")
                     break
-                if wallet_minted >= 10_000 * 10**18:
+                if wallet_minted >= WALLET_CAP_WEI:
                     print(f"{prefix} 🏁 Wallet [{wallet_idx}] cap reached, rotating...")
+                    capped_wallets.add(wallet_idx)
+                    wallet_idx = (wallet_idx + 1) % len(wallets)
+                    continue
+                # Near-cap check: next_mint would exceed 10k cap → TX will revert, treat as capped
+                if wallet_minted + next_mint > WALLET_CAP_WEI:
+                    remaining = (WALLET_CAP_WEI - wallet_minted) / 1e18
+                    print(
+                        f"{prefix} 🏁 Wallet [{wallet_idx}] near cap "
+                        f"(only {remaining:,.2f} PFFT left, next mint {next_mint/1e18:,.2f}), skipping..."
+                    )
                     capped_wallets.add(wallet_idx)
                     wallet_idx = (wallet_idx + 1) % len(wallets)
                     continue
@@ -690,6 +716,8 @@ def main():
     print(f"  Contract: {CONTRACT}")
     print(f"  RPC: {RPC}")
     print(f"  Grid: {GPU_BLOCKS} blocks x {GPU_THREADS} threads per GPU")
+    if MAX_GAS_PRICE_GWEI > 0:
+        print(f"  Max gas: {MAX_GAS_PRICE_GWEI} gwei")
     print("=" * 60)
 
     gpu_ids = get_available_gpus()

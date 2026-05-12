@@ -273,12 +273,33 @@ ABI = [
 ]
 
 
-def get_private_key_for_gpu(gpu_id: int) -> str:
-    """Get private key for a specific GPU. Falls back to PRIVATE_KEY if no per-GPU key."""
-    key = os.environ.get(f"PRIVATE_KEY_{gpu_id}", "")
-    if not key:
-        key = os.environ.get("PRIVATE_KEY", "")
-    return key.strip()
+def get_all_private_keys() -> list[str]:
+    """Collect all available private keys from env (PRIVATE_KEY_0, _1, ... and PRIVATE_KEY)."""
+    keys = []
+    # Collect numbered keys first
+    for i in range(100):  # support up to 100 wallets
+        k = os.environ.get(f"PRIVATE_KEY_{i}", "").strip()
+        if k and k != "your_private_key_here":
+            keys.append(k)
+        elif i > 10 and not k:
+            break  # stop scanning after gap
+    # Fallback to single PRIVATE_KEY if no numbered keys found
+    if not keys:
+        k = os.environ.get("PRIVATE_KEY", "").strip()
+        if k and k != "your_private_key_here":
+            keys.append(k)
+    return keys
+
+
+def get_private_key_for_gpu(gpu_id: int, total_gpus: int) -> str:
+    """Get private key for a specific GPU using round-robin across all available wallets.
+    
+    Example: 2 wallets + 4 GPUs → GPU0=wallet0, GPU1=wallet1, GPU2=wallet0, GPU3=wallet1
+    """
+    keys = get_all_private_keys()
+    if not keys:
+        return ""
+    return keys[gpu_id % len(keys)]
 
 
 def get_available_gpus() -> list[int]:
@@ -548,22 +569,24 @@ def main():
     gpu_ids = get_available_gpus()
     print(f"\n  🎮 Detected {len(gpu_ids)} GPU(s): {gpu_ids}")
 
-    # Validate keys
-    workers = []
-    for gpu_id in gpu_ids:
-        key = get_private_key_for_gpu(gpu_id)
-        if not key or key == "your_private_key_here":
-            print(f"  ⚠️  GPU {gpu_id}: No private key (PRIVATE_KEY_{gpu_id} or PRIVATE_KEY)")
-            continue
-        workers.append((gpu_id, key))
-
-    if not workers:
+    # Collect wallets and distribute across GPUs (round-robin)
+    all_keys = get_all_private_keys()
+    if not all_keys:
         print("\n❌ No valid private keys found!")
         print("   Set PRIVATE_KEY_0, PRIVATE_KEY_1, ... in .env")
         print("   Or set PRIVATE_KEY to use same wallet on all GPUs")
         sys.exit(1)
 
-    print(f"  ✅ Starting {len(workers)} worker(s)...\n")
+    print(f"  🔑 Found {len(all_keys)} wallet(s), distributing across {len(gpu_ids)} GPU(s) (round-robin)")
+
+    workers = []
+    for gpu_id in gpu_ids:
+        key = get_private_key_for_gpu(gpu_id, len(gpu_ids))
+        wallet_idx = gpu_id % len(all_keys)
+        print(f"     GPU {gpu_id} → wallet #{wallet_idx}")
+        workers.append((gpu_id, key))
+
+    print(f"\n  ✅ Starting {len(workers)} worker(s)...\n")
 
     # Spawn one process per GPU
     processes = []

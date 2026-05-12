@@ -9,6 +9,8 @@ Spawns one mining process per GPU. Each GPU uses its own wallet from .env:
   ...
 
 If only PRIVATE_KEY is set (no _0, _1, etc.), all GPUs use the same wallet.
+When multiple GPUs share a wallet, their nonce ranges are partitioned to
+avoid duplicate work.
 
 Usage:
   cp .env.example .env   # set PRIVATE_KEY_0, PRIVATE_KEY_1, ... and ETH_RPC
@@ -276,14 +278,12 @@ ABI = [
 def get_all_private_keys() -> list[str]:
     """Collect all available private keys from env (PRIVATE_KEY_0, _1, ... and PRIVATE_KEY)."""
     keys = []
-    # Collect numbered keys first
-    for i in range(100):  # support up to 100 wallets
+    for i in range(100):
         k = os.environ.get(f"PRIVATE_KEY_{i}", "").strip()
         if k and k != "your_private_key_here":
             keys.append(k)
         elif i > 10 and not k:
-            break  # stop scanning after gap
-    # Fallback to single PRIVATE_KEY if no numbered keys found
+            break
     if not keys:
         k = os.environ.get("PRIVATE_KEY", "").strip()
         if k and k != "your_private_key_here":
@@ -291,24 +291,11 @@ def get_all_private_keys() -> list[str]:
     return keys
 
 
-def get_private_key_for_gpu(gpu_id: int, total_gpus: int) -> str:
-    """Get private key for a specific GPU using round-robin across all available wallets.
-    
-    Example: 2 wallets + 4 GPUs → GPU0=wallet0, GPU1=wallet1, GPU2=wallet0, GPU3=wallet1
-    """
-    keys = get_all_private_keys()
-    if not keys:
-        return ""
-    return keys[gpu_id % len(keys)]
-
-
 def get_available_gpus() -> list[int]:
     """Get list of GPU IDs to use."""
     gpus_env = os.environ.get("GPUS", "")
     if gpus_env:
         return [int(x.strip()) for x in gpus_env.split(",") if x.strip()]
-
-    # Auto-detect all GPUs
     try:
         import pycuda.driver as cuda
         cuda.init()
@@ -318,12 +305,25 @@ def get_available_gpus() -> list[int]:
         return [0]
 
 
-def gpu_worker(gpu_id: int, private_key: str):
-    """Worker process for a single GPU."""
+def gpu_worker(
+    gpu_id: int,
+    worker_index: int,
+    total_workers: int,
+    private_key: str,
+    stop_event: multiprocessing.Event,
+):
+    """Worker process for a single GPU.
+
+    Args:
+        gpu_id: CUDA device index
+        worker_index: sequential index (0..N-1) for nonce partitioning
+        total_workers: total number of GPU workers
+        private_key: hex private key for this worker's wallet
+        stop_event: shared event to signal graceful shutdown
+    """
     import numpy as np
     import pycuda.driver as cuda
 
-    # Each process must init its own CUDA context
     cuda.init()
     device = cuda.Device(gpu_id)
     ctx = device.make_context()
@@ -345,11 +345,9 @@ def gpu_worker(gpu_id: int, private_key: str):
             return
 
         if not private_key.startswith("0x"):
-            private_key_hex = "0x" + private_key
-        else:
-            private_key_hex = private_key
+            private_key = "0x" + private_key
 
-        wallet = Account.from_key(private_key_hex)
+        wallet = Account.from_key(private_key)
         print(f"{prefix} ✅ Wallet: {wallet.address}")
 
         eth_bal = w3.eth.get_balance(wallet.address) / 1e18
@@ -366,7 +364,16 @@ def gpu_worker(gpu_id: int, private_key: str):
         round_num = 0
         global_start = time.time()
 
-        while True:
+        # Nonce partitioning: divide uint64 space across all workers
+        nonce_space = 2**64
+        slice_size = nonce_space // total_workers
+        my_nonce_start = worker_index * slice_size
+        my_nonce_end = (worker_index + 1) * slice_size if worker_index < total_workers - 1 else nonce_space
+        print(
+            f"{prefix} 🔢 Nonce range: 0x{my_nonce_start:016x} - 0x{(my_nonce_end - 1):016x}"
+        )
+
+        while not stop_event.is_set():
             round_num += 1
             print(f"\n{prefix} {'─' * 50}")
             print(f"{prefix} Round #{round_num}")
@@ -406,19 +413,22 @@ def gpu_worker(gpu_id: int, private_key: str):
                 time.sleep(15)
                 continue
 
-            # Get challenge
             challenge = contract.functions.currentPowChallenge(wallet.address).call()
             if not isinstance(challenge, bytes):
                 challenge = challenge.to_bytes(32, "big")
 
-            # Mine on GPU
             print(f"{prefix} ⛏️  Mining ({hex_zeros * 4}-bit difficulty)...")
-            nonce = _gpu_mine(np, cuda, kernel, challenge, target, prefix)
+            nonce = _gpu_mine(
+                np, cuda, kernel, challenge, target, prefix,
+                stop_event, my_nonce_start, my_nonce_end,
+            )
             if nonce is None:
-                print(f"{prefix} Stopped")
-                break
+                if stop_event.is_set():
+                    print(f"{prefix} Stopped by signal")
+                else:
+                    print(f"{prefix} Nonce range exhausted, re-randomizing...")
+                continue
 
-            # Verify
             try:
                 valid = contract.functions.isValidPow(wallet.address, nonce).call()
                 if not valid:
@@ -427,7 +437,6 @@ def gpu_worker(gpu_id: int, private_key: str):
             except Exception as exc:
                 print(f"{prefix} ⚠️  Verify error: {exc}, submitting anyway...")
 
-            # Submit
             if _submit_mint(w3, wallet, contract, nonce, prefix):
                 total_mints += 1
                 earned = next_mint / 1e18
@@ -443,7 +452,10 @@ def gpu_worker(gpu_id: int, private_key: str):
                 f"{total_pfft:,.2f} PFFT | {elapsed / 60:.1f} min"
             )
             print(f"{prefix} ⏳ {PAUSE_BETWEEN_ROUNDS}s cooldown...")
-            time.sleep(PAUSE_BETWEEN_ROUNDS)
+            for _ in range(PAUSE_BETWEEN_ROUNDS * 10):
+                if stop_event.is_set():
+                    break
+                time.sleep(0.1)
 
         print(f"\n{prefix} {'=' * 50}")
         print(f"{prefix} Session Summary")
@@ -457,8 +469,19 @@ def gpu_worker(gpu_id: int, private_key: str):
         ctx.detach()
 
 
-def _gpu_mine(np, cuda, kernel, challenge: bytes, target: int, prefix: str):
-    """Run GPU mining loop. Returns nonce or None."""
+def _gpu_mine(
+    np, cuda, kernel,
+    challenge: bytes,
+    target: int,
+    prefix: str,
+    stop_event: multiprocessing.Event,
+    nonce_range_start: int,
+    nonce_range_end: int,
+):
+    """Run GPU mining loop with partitioned nonce range.
+
+    Returns nonce (int) or None if stopped/exhausted.
+    """
     challenge_np = np.frombuffer(challenge, dtype=np.uint8).copy()
     target_np = np.frombuffer(target.to_bytes(32, "big"), dtype=np.uint8).copy()
     found_np = np.zeros(1, dtype=np.int32)
@@ -472,26 +495,39 @@ def _gpu_mine(np, cuda, kernel, challenge: bytes, target: int, prefix: str):
     cuda.memcpy_htod(challenge_gpu, challenge_np)
     cuda.memcpy_htod(target_gpu, target_np)
 
-    max_start = (2**64 - 1) - (GPU_BLOCKS * GPU_THREADS * GPU_BATCHES_PER_STATUS)
-    start_nonce = secrets.randbelow(max_start)
+    batch_size = GPU_BLOCKS * GPU_THREADS
+    range_size = nonce_range_end - nonce_range_start
+
+    # Random offset within assigned nonce range to avoid always starting at slice boundary
+    usable = range_size - (batch_size * GPU_BATCHES_PER_STATUS)
+    if usable > 0:
+        start_nonce = nonce_range_start + secrets.randbelow(usable)
+    else:
+        start_nonce = nonce_range_start
+
     total_hashes = 0
     start_time = time.time()
     last_report = start_time
-    batch_size = GPU_BLOCKS * GPU_THREADS
 
-    print(f"{prefix} 🎲 Start nonce: {start_nonce}")
+    print(f"{prefix} 🎲 Start nonce: {start_nonce} (range 0x{nonce_range_start:016x}..)")
 
-    while True:
+    while not stop_event.is_set():
+        if start_nonce >= nonce_range_end:
+            start_nonce = nonce_range_start
+
         found_np[0] = 0
         nonce_np[0] = 0
         cuda.memcpy_htod(found_gpu, found_np)
         cuda.memcpy_htod(nonce_gpu, nonce_np)
 
         for _ in range(GPU_BATCHES_PER_STATUS):
+            if stop_event.is_set():
+                return None
+
             kernel(
                 challenge_gpu,
                 target_gpu,
-                np.uint64(start_nonce),
+                np.uint64(start_nonce & 0xFFFFFFFFFFFFFFFF),
                 nonce_gpu,
                 found_gpu,
                 block=(GPU_THREADS, 1, 1),
@@ -559,7 +595,6 @@ def _submit_mint(w3, wallet, contract, nonce: int, prefix: str) -> bool:
 
 
 def main():
-    # Use 'spawn' instead of 'fork' to avoid CUDA re-init issues in child processes
     multiprocessing.set_start_method("spawn", force=True)
 
     print("=" * 60)
@@ -572,7 +607,6 @@ def main():
     gpu_ids = get_available_gpus()
     print(f"\n  🎮 Detected {len(gpu_ids)} GPU(s): {gpu_ids}")
 
-    # Collect wallets and distribute across GPUs (round-robin)
     all_keys = get_all_private_keys()
     if not all_keys:
         print("\n❌ No valid private keys found!")
@@ -580,39 +614,49 @@ def main():
         print("   Or set PRIVATE_KEY to use same wallet on all GPUs")
         sys.exit(1)
 
-    print(f"  🔑 Found {len(all_keys)} wallet(s), distributing across {len(gpu_ids)} GPU(s) (round-robin)")
+    total_workers = len(gpu_ids)
+    print(f"  🔑 Found {len(all_keys)} wallet(s), distributing across {total_workers} GPU(s) (round-robin)")
 
     workers = []
-    for gpu_id in gpu_ids:
-        key = get_private_key_for_gpu(gpu_id, len(gpu_ids))
-        wallet_idx = gpu_id % len(all_keys)
-        print(f"     GPU {gpu_id} → wallet #{wallet_idx}")
-        workers.append((gpu_id, key))
+    for idx, gpu_id in enumerate(gpu_ids):
+        key = all_keys[idx % len(all_keys)]
+        wallet_idx = idx % len(all_keys)
+        print(f"     GPU {gpu_id} (worker #{idx}) → wallet #{wallet_idx}")
+        workers.append((gpu_id, idx, key))
+
+    stop_event = multiprocessing.Event()
+
+    def _signal_handler(sig, frame):
+        print("\n\n  ⚠️  Stopping all GPU workers...")
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
 
     print(f"\n  ✅ Starting {len(workers)} worker(s)...\n")
 
-    # Spawn one process per GPU
     processes = []
-    for gpu_id, key in workers:
+    for gpu_id, worker_idx, key in workers:
         p = multiprocessing.Process(
             target=gpu_worker,
-            args=(gpu_id, key),
+            args=(gpu_id, worker_idx, total_workers, key, stop_event),
             name=f"gpu-{gpu_id}",
-            daemon=True,
         )
         p.start()
         processes.append(p)
 
-    # Wait for all to finish or Ctrl+C
     try:
         for p in processes:
             p.join()
     except KeyboardInterrupt:
-        print("\n\n  ⚠️  Stopping all GPU workers...")
+        print("\n\n  ⚠️  Force stopping all GPU workers...")
+        stop_event.set()
         for p in processes:
-            p.terminate()
+            p.join(timeout=10)
         for p in processes:
-            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=5)
         print("  Done.")
 
 

@@ -2,24 +2,21 @@
 """
 PFFT Multi-GPU Miner Bot — NVIDIA CUDA (all GPUs, multiple wallets)
 
-Spawns one mining process per GPU. Each GPU rotates through its assigned
-wallets after each successful mint.
-
-Wallet distribution (stride pattern):
-  10 wallets + 4 GPUs:
-    GPU 0 → wallets [0, 4, 8]
-    GPU 1 → wallets [1, 5, 9]
-    GPU 2 → wallets [2, 6]
-    GPU 3 → wallets [3, 7]
-
-Wallet config in .env:
-  PRIVATE_KEY_0=...   (wallet 0)
-  PRIVATE_KEY_1=...   (wallet 1)
+Spawns one mining process per GPU. Each GPU uses its own wallet from .env:
+  PRIVATE_KEY_0=...   (GPU 0)
+  PRIVATE_KEY_1=...   (GPU 1)
+  PRIVATE_KEY_2=...   (GPU 2)
   ...
-  Or just PRIVATE_KEY=... for a single wallet on all GPUs.
+
+If only PRIVATE_KEY is set (no _0, _1, etc.), all GPUs use the same wallet.
+When multiple GPUs share a wallet, their nonce ranges are partitioned to
+avoid duplicate work.
+
+TX submission is non-blocking: after submit, worker rotates to next wallet
+immediately and polls receipts in background while mining continues.
 
 Usage:
-  cp .env.example .env
+  cp .env.example .env   # set PRIVATE_KEY_0, PRIVATE_KEY_1, ... and ETH_RPC
   python3 pfft_multi_gpu_miner.py
 
 Optional env:
@@ -318,7 +315,7 @@ def gpu_worker(
     wallet_keys: list[str],
     stop_event: multiprocessing.Event,
 ):
-    """Worker process for a single GPU with wallet rotation.
+    """Worker process for a single GPU with wallet rotation + non-blocking TX tracking.
 
     Args:
         gpu_id: CUDA device index
@@ -382,14 +379,33 @@ def gpu_worker(
         global_start = time.time()
         wallet_idx = 0
         capped_wallets: set[int] = set()
+        pending_txs: dict[int, dict] = {}
 
         while not stop_event.is_set():
-            if len(capped_wallets) >= len(wallets):
+            new_mints, new_pfft = _poll_pending_txs(w3, pending_txs, prefix)
+            total_mints += new_mints
+            total_pfft += new_pfft
+
+            if len(capped_wallets) >= len(wallets) and not pending_txs:
                 print(f"{prefix} 🏁 All {len(wallets)} wallet(s) reached cap!")
                 break
 
-            if wallet_idx in capped_wallets:
+            found_available = False
+            for _ in range(len(wallets)):
+                if wallet_idx not in capped_wallets and wallet_idx not in pending_txs:
+                    found_available = True
+                    break
                 wallet_idx = (wallet_idx + 1) % len(wallets)
+
+            if not found_available:
+                print(
+                    f"{prefix} ⏳ All wallets busy "
+                    f"(pending: {len(pending_txs)}, capped: {len(capped_wallets)}), waiting 3s..."
+                )
+                for _ in range(30):
+                    if stop_event.is_set():
+                        break
+                    time.sleep(0.1)
                 continue
 
             wallet = wallets[wallet_idx]
@@ -467,29 +483,34 @@ def gpu_worker(
             except Exception as exc:
                 print(f"{prefix} ⚠️  Verify error: {exc}, submitting anyway...")
 
-            if _submit_mint(w3, wallet, contract, nonce, prefix):
-                total_mints += 1
-                earned = next_mint / 1e18
-                total_pfft += earned
-                print(
-                    f"{prefix} 💰 +{earned:,.2f} PFFT | "
-                    f"Total: {total_pfft:,.2f} PFFT from {total_mints} mints"
-                )
+            tx_hash_hex = _submit_mint_nonblocking(w3, wallet, contract, nonce, prefix)
+            if tx_hash_hex:
+                pending_txs[wallet_idx] = {
+                    "tx_hash": tx_hash_hex,
+                    "earned": next_mint / 1e18,
+                    "submit_time": time.time(),
+                }
+                print(f"{prefix} 🚀 TX pending for wallet [{wallet_idx}], rotating immediately...")
 
             elapsed = time.time() - global_start
             print(
-                f"\n{prefix} 📈 Session: {total_mints} mints | "
-                f"{total_pfft:,.2f} PFFT | {elapsed / 60:.1f} min"
+                f"{prefix} 📈 Session: {total_mints} confirmed | "
+                f"{total_pfft:,.2f} PFFT | {len(pending_txs)} pending | "
+                f"{elapsed / 60:.1f} min"
             )
 
-            # Rotate to next wallet after each mint
             wallet_idx = (wallet_idx + 1) % len(wallets)
 
-            print(f"{prefix} ⏳ {PAUSE_BETWEEN_ROUNDS}s cooldown...")
-            for _ in range(PAUSE_BETWEEN_ROUNDS * 10):
-                if stop_event.is_set():
-                    break
-                time.sleep(0.1)
+        # Drain remaining pending TXs before exit (up to 60s)
+        if pending_txs and not stop_event.is_set():
+            print(f"{prefix} ⏳ Draining {len(pending_txs)} pending TX(s)...")
+            drain_start = time.time()
+            while pending_txs and time.time() - drain_start < 60 and not stop_event.is_set():
+                new_mints, new_pfft = _poll_pending_txs(w3, pending_txs, prefix)
+                total_mints += new_mints
+                total_pfft += new_pfft
+                if pending_txs:
+                    time.sleep(2)
 
         print(f"\n{prefix} {'=' * 50}")
         print(f"{prefix} Session Summary")
@@ -596,8 +617,8 @@ def _gpu_mine(
     return None
 
 
-def _submit_mint(w3, wallet, contract, nonce: int, prefix: str) -> bool:
-    """Submit freeMint transaction."""
+def _submit_mint_nonblocking(w3, wallet, contract, nonce: int, prefix: str) -> str | None:
+    """Submit freeMint TX without waiting for receipt. Returns tx_hash hex or None on error."""
     try:
         fn = contract.functions.freeMint(nonce)
         tx = fn.build_transaction(
@@ -613,18 +634,52 @@ def _submit_mint(w3, wallet, contract, nonce: int, prefix: str) -> bool:
 
         signed = wallet.sign_transaction(tx)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        print(f"{prefix} 📤 TX: https://etherscan.io/tx/0x{tx_hash.hex()}")
-
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
-        if receipt.status == 1:
-            print(f"{prefix} ✅ MINT OK | Block {receipt.blockNumber} | Gas {receipt.gasUsed}")
-            return True
-
-        print(f"{prefix} ❌ REVERTED | Gas {receipt.gasUsed}")
-        return False
+        tx_hex = "0x" + tx_hash.hex()
+        print(f"{prefix} 📤 TX: https://etherscan.io/tx/{tx_hex}")
+        return tx_hex
     except Exception as exc:
-        print(f"{prefix} ❌ TX error: {exc}")
-        return False
+        print(f"{prefix} ❌ TX submit error: {exc}")
+        return None
+
+
+def _poll_pending_txs(w3, pending_txs: dict, prefix: str) -> tuple[int, float]:
+    """Poll pending TXs without blocking. Returns (confirmed_count, pfft_earned).
+
+    Mutates pending_txs in place — removes resolved (success/reverted) entries.
+    """
+    confirmed = 0
+    earned_total = 0.0
+    resolved_wallet_ids = []
+
+    for wallet_id, info in pending_txs.items():
+        try:
+            receipt = w3.eth.get_transaction_receipt(info["tx_hash"])
+        except Exception:
+            # Still pending — web3 raises TransactionNotFound when no receipt yet
+            elapsed = time.time() - info["submit_time"]
+            if elapsed > 300:
+                print(f"{prefix} ⚠️  TX for wallet [{wallet_id}] stuck >5min, abandoning")
+                resolved_wallet_ids.append(wallet_id)
+            continue
+
+        if receipt is None:
+            continue
+
+        if receipt.status == 1:
+            print(
+                f"{prefix} ✅ MINT OK wallet [{wallet_id}] | Block {receipt.blockNumber} | "
+                f"+{info['earned']:,.2f} PFFT"
+            )
+            confirmed += 1
+            earned_total += info["earned"]
+        else:
+            print(f"{prefix} ❌ REVERTED wallet [{wallet_id}] | Block {receipt.blockNumber}")
+        resolved_wallet_ids.append(wallet_id)
+
+    for wid in resolved_wallet_ids:
+        del pending_txs[wid]
+
+    return confirmed, earned_total
 
 
 def main():
